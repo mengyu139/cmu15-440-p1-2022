@@ -49,6 +49,14 @@ type UDPConn struct {
 	nconn *net.UDPConn
 }
 
+func (c *UDPConn) SetDeadline(t time.Time) error {
+	return c.nconn.SetDeadline(t)
+}
+
+func (c *UDPConn) SetReadDeadline(t time.Time) error {
+	return c.nconn.SetReadDeadline(t)
+}
+
 // Read implements the Conn Read method.
 func (c *UDPConn) Read(b []byte) (n int, err error) {
 	var buffer [2000]byte
