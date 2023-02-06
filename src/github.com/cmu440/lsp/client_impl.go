@@ -71,6 +71,7 @@ func NewClient(hostport string, initialSeqNum int, params *Params) (Client, erro
 				return nil, err
 			}
 		default:
+			// for connect, we should retry every epoch rather than backoff
 			msg, raddr, err := c.recvMessage(readBytes)
 			if err != nil {
 				log.WithError(err).Error("recvMessage failed")
@@ -107,27 +108,8 @@ func (c *client) recvMessage(readBytes []byte) (*Message, *lspnet.UDPAddr, error
 	return &msg, rAddr, nil
 }
 
-// send connect intention and wait for ack response
-func (c *client) Ack(params *Params) error {
-	_, err := c.conn.WriteToUDP([]byte("ack"), c.remoteAddr)
-	if err != nil {
-		return err
-	}
-
-	rcv := make([]byte, 1024)
-	n, err := c.conn.Read(rcv)
-	if err != nil {
-		return err
-	}
-
-	rcvs := string(rcv[0:n])
-	rcvs = rcvs
-
-	return nil
-}
-
 func (c *client) ConnID() int {
-	return -1
+	return c.connID
 }
 
 func (c *client) Read() ([]byte, error) {
