@@ -5,7 +5,6 @@ package lsp
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -19,6 +18,20 @@ var (
 )
 
 const MAXN = 1024
+
+type MessageData struct {
+	Message    *Message
+	curBackoff int // 0 1 2 4 8 ...
+	lastTime   time.Time
+	firstTime  time.Time
+	timeout    bool
+}
+
+func CreateMessageData(msg *Message) *MessageData {
+	return &MessageData{
+		Message: msg,
+	}
+}
 
 type client struct {
 	// control
@@ -36,7 +49,6 @@ type client struct {
 	nextSendSn    int
 	nextRecvSn    int
 	freeCnt       int
-	isnMtx        sync.Mutex
 
 	dataPool map[int][]byte
 
@@ -46,9 +58,20 @@ type client struct {
 	// chan
 	// message should be push to this chan before writing to udp
 	sendMsgCh       chan *Message
+	sendDataCh      chan *MessageData
+	sendAckCh       chan *Message
 	connectLoopDone chan int
 	connectDone     chan int
 	dataBuffer      chan []byte
+
+	ackSlot   int
+	ackWindow int
+
+	// memo
+	// key: isn
+	windowMemo map[int]*MessageData
+	unAckCnt   int
+	minAckSn   int
 }
 
 // NewClient creates, initiates, and returns a new client. This function
@@ -89,11 +112,23 @@ func NewClient(hostport string, initialSeqNum int, params *Params) (Client, erro
 		nextRecvSn:      initialSeqNum + 1,
 		epochTimer:      time.NewTimer(0),
 		sendMsgCh:       make(chan *Message, 1),
+		sendDataCh:      make(chan *MessageData, 1),
+		sendAckCh:       make(chan *Message, params.MaxUnackedMessages+10),
 		connectDone:     make(chan int, 1),
 		connectLoopDone: make(chan int, 1),
 		g:               &sync.WaitGroup{},
 		dataBuffer:      make(chan []byte, params.WindowSize*2+10),
 		dataPool:        make(map[int][]byte, 10),
+		ackSlot:         params.MaxUnackedMessages,
+		ackWindow:       params.WindowSize,
+
+		// we consider sn:0 is acked
+		windowMemo: map[int]*MessageData{
+			0: nil,
+		},
+	}
+	for i := 0; i < params.MaxUnackedMessages; i++ {
+		c.sendAckCh <- nil
 	}
 
 	c.g.Add(3)
@@ -103,11 +138,22 @@ func NewClient(hostport string, initialSeqNum int, params *Params) (Client, erro
 
 	select {
 	case <-c.connectDone:
+		c.g.Add(3)
+		go c.sendDataLoop()
+		go c.sendBackoffLoop()
+		go c.monitorLoop()
 		return c, nil
 	case <-c.ctx.Done():
 		return nil, errClientClosed
 	}
-
+}
+func (c *client) monitorLoop() {
+	defer c.g.Done()
+	select {
+	case <-c.ctx.Done():
+		c.epochTimer.Stop()
+		c.conn.Close()
+	}
 }
 
 func (c *client) connectLoop() error {
@@ -130,7 +176,7 @@ func (c *client) connectLoop() error {
 			// resend connect message
 			msg := NewConnect(c.initialSeqNum)
 
-			c.write(msg)
+			c.sendMsg(msg)
 
 		case <-c.connectDone:
 			select {
@@ -140,25 +186,6 @@ func (c *client) connectLoop() error {
 
 			return nil
 
-		}
-	}
-}
-
-func (c *client) sendLoop() {
-	defer c.g.Done()
-
-	for {
-		select {
-		case <-c.ctx.Done():
-			log.WithField("func", "sendLoop").Info("exit")
-			return
-		case msg := <-c.sendMsgCh:
-			b, err := json.Marshal(msg)
-			if err != nil {
-				log.WithError(err).Error("marshal msg failed")
-				continue
-			}
-			c.conn.Write(b)
 		}
 	}
 }
@@ -191,11 +218,11 @@ func (c *client) recvLoop() {
 
 				// send ack
 				ack := NewAck(msg.ConnID, msg.SeqNum)
-				c.write(ack)
+				c.sendAck(ack)
 				continue
 			}
 
-			// ack for connect
+			// server ack for connect
 			if msg.Type == MsgAck && msg.SeqNum == 0 {
 				select {
 				case c.connectLoopDone <- 1:
@@ -203,6 +230,11 @@ func (c *client) recvLoop() {
 				default:
 				}
 				continue
+			}
+
+			// server ack for data msg
+			if msg.Type == MsgAck {
+				c.sendAck(msg)
 			}
 		}
 	}
@@ -212,6 +244,8 @@ func (c *client) storeDara(msg *Message) error {
 	if msg.SeqNum == c.nextRecvSn {
 		c.nextRecvSn += 1
 		c.dataBuffer <- msg.Payload
+
+		// find other data in order
 		for {
 			if payload, ok := c.dataPool[c.nextRecvSn]; ok {
 				c.nextRecvSn += 1
@@ -227,15 +261,6 @@ func (c *client) storeDara(msg *Message) error {
 		c.dataPool[msg.SeqNum] = msg.Payload
 	}
 	return nil
-}
-
-func (c *client) write(msg *Message) error {
-	select {
-	case <-c.ctx.Done():
-		return errClientClosed
-	case c.sendMsgCh <- msg:
-		return nil
-	}
 }
 
 func (c *client) recvMessage(readBytes []byte) (*Message, error) {
@@ -267,19 +292,17 @@ func (c *client) Read() ([]byte, error) {
 	}
 }
 
+// msg -> sendDataCh -> sendMsgCh
 func (c *client) Write(payload []byte) error {
-	c.isnMtx.Lock()
-	defer c.isnMtx.Unlock()
 	check := CalculateChecksum(c.connID, c.nextSendSn, len(payload), payload)
 	msg := NewData(c.connID, c.nextSendSn, len(payload), payload, check)
 	c.nextSendSn += 1
-	return c.write(msg)
+	return c.sendData(CreateMessageData(msg))
 }
 
 func (c *client) Close() error {
 	c.cancel()
-	c.epochTimer.Stop()
 	c.g.Wait()
 
-	return errors.New("not yet implemented")
+	return nil
 }
