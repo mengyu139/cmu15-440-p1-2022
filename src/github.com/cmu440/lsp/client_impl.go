@@ -17,61 +17,17 @@ var (
 	errClientClosed = fmt.Errorf("client is alread closed")
 )
 
-const MAXN = 1024
-
-type MessageData struct {
-	Message    *Message
-	curBackoff int // 0 1 2 4 8 ...
-	lastTime   time.Time
-	firstTime  time.Time
-	timeout    bool
-}
-
-func CreateMessageData(msg *Message) *MessageData {
-	return &MessageData{
-		Message: msg,
-	}
-}
-
 type client struct {
 	// control
 	ctx    context.Context
 	cancel context.CancelFunc
 	g      *sync.WaitGroup
 
-	params     *Params
-	conn       *lspnet.UDPConn
-	remoteAddr *lspnet.UDPAddr
-	connID     int
+	params *Params
+	conn   *lspnet.UDPConn
+	connID int
 
-	// var
-	initialSeqNum int
-	nextSendSn    int
-	nextRecvSn    int
-	freeCnt       int
-
-	dataPool map[int][]byte
-
-	// epoch
-	epochTimer *time.Timer
-
-	// chan
-	// message should be push to this chan before writing to udp
-	sendMsgCh       chan *Message
-	sendDataCh      chan *MessageData
-	sendAckCh       chan *Message
-	connectLoopDone chan int
-	connectDone     chan int
-	dataBuffer      chan []byte
-
-	ackSlot   int
-	ackWindow int
-
-	// memo
-	// key: isn
-	windowMemo map[int]*MessageData
-	unAckCnt   int
-	minAckSn   int
+	commonClient *CommonClient
 }
 
 // NewClient creates, initiates, and returns a new client. This function
@@ -99,178 +55,69 @@ func NewClient(hostport string, initialSeqNum int, params *Params) (Client, erro
 		return nil, err
 	}
 
-	ctx, cancel := context.WithCancel(context.TODO())
-
-	c := &client{
-		ctx:             ctx,
-		cancel:          cancel,
-		params:          params,
-		conn:            conn,
-		remoteAddr:      addr,
-		initialSeqNum:   initialSeqNum,
-		nextSendSn:      initialSeqNum + 1,
-		nextRecvSn:      initialSeqNum + 1,
-		epochTimer:      time.NewTimer(0),
-		sendMsgCh:       make(chan *Message, 1),
-		sendDataCh:      make(chan *MessageData, 1),
-		sendAckCh:       make(chan *Message, params.MaxUnackedMessages+10),
-		connectDone:     make(chan int, 1),
-		connectLoopDone: make(chan int, 1),
-		g:               &sync.WaitGroup{},
-		dataBuffer:      make(chan []byte, params.WindowSize*2+10),
-		dataPool:        make(map[int][]byte, 10),
-		ackSlot:         params.MaxUnackedMessages,
-		ackWindow:       params.WindowSize,
-
-		// we consider sn:0 is acked
-		windowMemo: map[int]*MessageData{
-			0: nil,
-		},
-	}
-	for i := 0; i < params.MaxUnackedMessages; i++ {
-		c.sendAckCh <- nil
-	}
-
-	c.g.Add(3)
-	go c.connectLoop()
-	go c.recvLoop()
-	go c.sendLoop()
-
-	select {
-	case <-c.connectDone:
-		c.g.Add(3)
-		go c.sendDataLoop()
-		go c.sendBackoffLoop()
-		go c.monitorLoop()
-		return c, nil
-	case <-c.ctx.Done():
-		return nil, errClientClosed
-	}
-}
-func (c *client) monitorLoop() {
-	defer c.g.Done()
-	select {
-	case <-c.ctx.Done():
-		c.epochTimer.Stop()
-		c.conn.Close()
-	}
-}
-
-func (c *client) connectLoop() error {
-	defer c.g.Done()
-	for {
-		select {
-		case <-c.ctx.Done():
-			return errClientClosed
-
-		case <-c.epochTimer.C:
-			c.freeCnt += 1
-
-			// client is lost
-			if c.freeCnt >= c.params.EpochLimit {
-				err := fmt.Errorf("wait too long before connect")
-				log.WithError(err).Error("connect failed")
-				return err
-			}
-
-			// resend connect message
-			msg := NewConnect(c.initialSeqNum)
-
-			c.sendMsg(msg)
-
-		case <-c.connectDone:
-			select {
-			case c.connectDone <- 1:
-			default:
-			}
-
-			return nil
-
-		}
-	}
-}
-
-func (c *client) recvLoop() {
-	defer c.g.Done()
-
-	readBytes := make([]byte, MAXN)
-
-	for {
-		select {
-		case <-c.ctx.Done():
-			log.WithField("func", "recvLoop").Info("exit")
-			return
-		default:
-			msg, err := c.recvMessage(readBytes)
+	connect := func() (int, error) {
+		// try connect
+		readBytes := make([]byte, MAXN)
+		connID := 0
+		done := false
+		for i := 0; i < params.EpochLimit; i++ {
+			connectMsg := NewConnect(initialSeqNum)
+			b, err := json.Marshal(connectMsg)
 			if err != nil {
-				log.WithError(err).Error("recvMessage failed")
-				continue
+				log.WithError(err).Error("marshal connectMsg failed")
+				return 0, err
 			}
-			if msg == nil {
-				continue
-			}
-
-			c.freeCnt = 0
-
-			if msg.Type == MsgData {
-				// store data in buffer or pool
-				c.storeDara(msg)
-
-				// send ack
-				ack := NewAck(msg.ConnID, msg.SeqNum)
-				c.sendAck(ack)
-				continue
+			conn.SetDeadline(time.Now().Add(time.Millisecond * time.Duration(params.EpochMillis)))
+			if _, err := conn.Write(b); err != nil {
+				log.WithError(err).Error("conn write bytes failed")
+				return 0, err
 			}
 
-			// server ack for connect
-			if msg.Type == MsgAck && msg.SeqNum == 0 {
-				select {
-				case c.connectLoopDone <- 1:
-					c.connID = msg.ConnID
-				default:
-				}
-				continue
+			msg, err := recvMessage(conn, readBytes, params)
+			if err != nil {
+				log.WithError(err).Error("conn recvMessage failed")
+				return 0, err
 			}
 
-			// server ack for data msg
-			if msg.Type == MsgAck {
-				c.sendAck(msg)
+			if msg.Type == MsgAck && msg.ConnID != 0 {
+				connID = msg.ConnID
+				done = true
+				break
 			}
 		}
-	}
-}
-
-func (c *client) storeDara(msg *Message) error {
-	if msg.SeqNum == c.nextRecvSn {
-		c.nextRecvSn += 1
-		c.dataBuffer <- msg.Payload
-
-		// find other data in order
-		for {
-			if payload, ok := c.dataPool[c.nextRecvSn]; ok {
-				c.nextRecvSn += 1
-				c.dataBuffer <- payload
-
-				//remove reference
-				c.dataPool[c.nextRecvSn] = nil
-				continue
-			}
-			break
+		if !done {
+			err := fmt.Errorf("connect failed")
+			log.WithError(err).Error("")
+			return 0, err
 		}
-	} else {
-		c.dataPool[msg.SeqNum] = msg.Payload
+		return connID, nil
 	}
-	return nil
-}
 
-func (c *client) recvMessage(readBytes []byte) (*Message, error) {
-	c.conn.SetReadDeadline(time.Now().Add(time.Millisecond * time.Duration(c.params.EpochMillis)))
-	readSize, rAddr, err := c.conn.ReadFromUDP(readBytes)
+	connID, err := connect()
 	if err != nil {
+		conn.Close()
 		return nil, err
 	}
-	if !rAddr.IsSame(c.remoteAddr) {
-		return nil, nil
+
+	// build common client
+	ctx, cancel := context.WithCancel(context.Background())
+	commonClient := NewCommonClient(ctx, connID, params, initialSeqNum+1, nil)
+	c := &client{
+		ctx:          ctx,
+		cancel:       cancel,
+		connID:       connID,
+		conn:         conn,
+		commonClient: commonClient,
+	}
+
+	return c, nil
+}
+
+func recvMessage(conn *lspnet.UDPConn, readBytes []byte, params *Params) (*Message, error) {
+	conn.SetReadDeadline(time.Now().Add(time.Millisecond * time.Duration(params.EpochMillis)))
+	readSize, err := conn.Read(readBytes)
+	if err != nil {
+		return nil, err
 	}
 	var msg Message
 	if err = json.Unmarshal(readBytes[:readSize], &msg); err != nil {
@@ -287,22 +134,28 @@ func (c *client) Read() ([]byte, error) {
 	select {
 	case <-c.ctx.Done():
 		return nil, errClientClosed
-	case data := <-c.dataBuffer:
-		return data, nil
+	default:
 	}
+	return c.commonClient.Read()
 }
 
-// msg -> sendDataCh -> sendMsgCh
 func (c *client) Write(payload []byte) error {
-	check := CalculateChecksum(c.connID, c.nextSendSn, len(payload), payload)
-	msg := NewData(c.connID, c.nextSendSn, len(payload), payload, check)
-	c.nextSendSn += 1
-	return c.sendData(CreateMessageData(msg))
+	select {
+	case <-c.ctx.Done():
+		return errClientClosed
+	default:
+	}
+	return c.commonClient.Send(payload)
 }
 
 func (c *client) Close() error {
+	select {
+	case <-c.ctx.Done():
+		return errClientClosed
+	default:
+	}
+	c.commonClient.Close()
 	c.cancel()
-	c.g.Wait()
-
+	c.conn.Close()
 	return nil
 }
