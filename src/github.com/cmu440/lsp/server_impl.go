@@ -332,6 +332,8 @@ func (s *server) recvLoop() {
 			continue
 		}
 
+		log.WithField("msg", msg).WithField("addr", addr).Info("recv client msg")
+
 		select {
 		case <-s.ctx.Done():
 			return

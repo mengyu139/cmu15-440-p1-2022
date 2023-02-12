@@ -21,8 +21,8 @@ type SendScheduler struct {
 	ctx      context.Context
 	sendList *list.List
 
-	epoch         int
-	lastSendEpoch int
+	epoch            int
+	lastSendTimStamp time.Time
 }
 
 func NewSendScheduler(ctx context.Context, connId int, sn int, params *Params) *SendScheduler {
@@ -84,7 +84,7 @@ func (s *SendScheduler) Tick(e int) {
 	}
 
 	// heartbeat
-	if s.epoch-s.lastSendEpoch > 1 {
+	if time.Since(s.lastSendTimStamp).Milliseconds() > int64(s.params.EpochMillis)/2 {
 		s.output(NewAck(s.connId, 0))
 	}
 
@@ -180,7 +180,7 @@ func (s *SendScheduler) output(msg *Message) {
 	case <-s.ctx.Done():
 		return
 	case s.outCh <- msg:
-		s.lastSendEpoch = s.epoch
+		s.lastSendTimStamp = time.Now()
 		return
 	}
 }
