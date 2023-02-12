@@ -14,8 +14,9 @@ import (
 )
 
 var (
-	errClientClosed = fmt.Errorf("client is alread closed")
-	errClientLost   = fmt.Errorf("conn is lost")
+	errClientClosing = fmt.Errorf("client is closing")
+	errClientClosed  = fmt.Errorf("client is alread closed")
+	errClientLost    = fmt.Errorf("conn is lost")
 )
 
 type client struct {
@@ -33,11 +34,11 @@ type client struct {
 	epoch         int
 	lastRecvEpoch int // lastest epoch stamp when recieve msg from server
 
-	readCh     chan *Message
-	writeCh    chan *Message
-	sendCh     chan []byte
-	epochTimer *time.Timer
-	g          *sync.WaitGroup
+	readCh      chan *Message
+	writeCh     chan *Message
+	sendCh      chan []byte
+	epochTicker *time.Ticker
+	g           *sync.WaitGroup
 }
 
 // NewClient creates, initiates, and returns a new client. This function
@@ -115,19 +116,21 @@ func NewClient(hostport string, initialSeqNum int, params *Params) (Client, erro
 	// build common client
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &client{
-		ctx:        ctx,
-		cancel:     cancel,
-		connID:     connID,
-		conn:       conn,
-		sendSch:    NewSendScheduler(ctx, connID, initialSeqNum, params),
-		recvSch:    NewRecvScheduler(ctx, connID, initialSeqNum, params),
-		params:     params,
-		readCh:     make(chan *Message, 1000),
-		writeCh:    make(chan *Message, 100),
-		sendCh:     make(chan []byte, 100),
-		epochTimer: time.NewTimer(time.Millisecond * time.Duration(params.EpochMillis)),
-		g:          &sync.WaitGroup{},
+		ctx:         ctx,
+		cancel:      cancel,
+		connID:      connID,
+		conn:        conn,
+		sendSch:     NewSendScheduler(ctx, connID, initialSeqNum, params),
+		recvSch:     NewRecvScheduler(ctx, connID, initialSeqNum, params),
+		params:      params,
+		readCh:      make(chan *Message, 1000),
+		writeCh:     make(chan *Message, 100),
+		sendCh:      make(chan []byte, 100),
+		epochTicker: time.NewTicker(time.Millisecond * time.Duration(params.EpochMillis)),
+		g:           &sync.WaitGroup{},
 	}
+
+	log.WithField("params", params).Info("init client")
 
 	c.g.Add(3)
 	go c.mainLoop()
@@ -149,8 +152,10 @@ func (c *client) mainLoop() {
 		case payload := <-c.sendCh:
 			c.sendSch.Send(payload)
 
-		case <-c.epochTimer.C:
+		case <-c.epochTicker.C:
 			c.sendSch.Tick()
+			c.epoch += 1
+			log.WithField("epoch", c.epoch).Info("tick...")
 
 		case msg := <-c.readCh:
 			if msg == nil {
@@ -171,11 +176,6 @@ func (c *client) mainLoop() {
 
 				continue
 			}
-
-			// no connect for client side
-			// if msg.Type == MsgConnect {
-
-			// }
 		}
 	}
 }
@@ -195,7 +195,6 @@ func (c *client) recvLoop() {
 
 		msg, err := recvMessage(c.conn, readBytes, c.params)
 		if err != nil {
-			log.WithError(err).Error("recvMessage failed")
 			continue
 		}
 

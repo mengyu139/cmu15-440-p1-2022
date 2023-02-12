@@ -34,7 +34,7 @@ type server struct {
 	g      *sync.WaitGroup
 
 	// epoch
-	epochTimer *time.Timer
+	epochTicker *time.Ticker
 
 	udpServer *lspnet.UDPConn
 
@@ -58,6 +58,10 @@ type server struct {
 	schedulers map[int]*Scheduler
 	// key: addr string
 	schedulersWithAddr map[string]*Scheduler
+
+	runningCnt int
+	closing    bool
+	closed     chan int
 }
 
 // NewServer creates, initiates, and returns a new server. This function should
@@ -85,7 +89,7 @@ func NewServer(port int, params *Params) (Server, error) {
 		cancel:             cancel,
 		port:               port,
 		params:             params,
-		epochTimer:         time.NewTimer(time.Millisecond * time.Duration(params.EpochMillis)),
+		epochTicker:        time.NewTicker(time.Millisecond * time.Duration(params.EpochMillis)),
 		g:                  &sync.WaitGroup{},
 		udpServer:          udpServer,
 		recvCh:             make(chan *MessageWithAddr, 100),
@@ -95,6 +99,7 @@ func NewServer(port int, params *Params) (Server, error) {
 		readCh:             make(chan *Message, 100),
 		dataForReadCh:      make(chan *MessageWithErr, 1000),
 		dataForWriteUPDCh:  make(chan *MessageWithAddr, 1000),
+		closed:             make(chan int),
 	}
 
 	s.g.Add(3)
@@ -130,19 +135,36 @@ func (s *server) Write(connId int, payload []byte) error {
 	if !ok {
 		return errClientClosed
 	}
-	if v.Lost() {
+	if v.Lost(false) {
 		return errClientLost
 	}
+
+	if v.Closing() {
+		return errClientClosing
+	}
+	if v.Closed() {
+		return errClientClosed
+	}
+
 	v.Send(payload)
 
 	return nil
 }
 
 func (s *server) CloseConn(connId int) error {
+
 	select {
 	case <-s.ctx.Done():
 		return errClientClosed
-	case s.closeConnCh <- connId:
+	default:
+	}
+
+	s.schedulersMtx.Lock()
+	_, ok := s.schedulers[connId]
+	s.schedulersMtx.Unlock()
+
+	if !ok {
+		return errClientClosed
 	}
 
 	return nil
@@ -156,10 +178,21 @@ func (s *server) Close() error {
 	default:
 	}
 
-	s.cancel()
-	s.g.Wait()
+	// close all conn
+	s.schedulersMtx.Lock()
+	for _, v := range s.schedulers {
+		state := v.State()
+		if state == StateRuning {
+			log.WithField("connID", v.ConnID()).Info("is closing")
+			v.Close()
+		}
+	}
+	s.schedulersMtx.Unlock()
 
-	// todo: close all conn
+	// wait for closed signal
+	select {
+	case <-s.closed:
+	}
 
 	// stop server
 	return s.udpServer.Close()
@@ -173,10 +206,37 @@ func (s *server) mainLoop() {
 		select {
 		case <-s.ctx.Done():
 			return
-		case <-s.epochTimer.C:
+		case <-s.epochTicker.C:
+			s.schedulersMtx.Lock()
 			for _, v := range s.schedulers {
-				v.Lost()
-				v.Tick()
+				state := v.Tick()
+
+				if state == StateClosed {
+					log.WithField("connID", v.ConnID()).Info("closed")
+
+					v.Cancel()
+					delete(s.schedulers, v.ConnID())
+					delete(s.schedulersWithAddr, v.AddrStr())
+
+					s.runningCnt -= 1
+					continue
+				}
+
+				// check lost
+				v.Lost(true)
+
+			}
+			s.schedulersMtx.Unlock()
+
+			// close
+			select {
+			case <-s.closed:
+				log.Info("server is closed")
+			default:
+				if s.closing && s.runningCnt == 0 {
+					log.Info("all running scheduler are closed, server is ready to be close")
+				}
+				close(s.closed)
 			}
 
 		case amsg := <-s.recvCh:
@@ -198,6 +258,7 @@ func (s *server) mainLoop() {
 					go s.readMonitor(sch.Done(), sch.RecvOutput())
 					go s.sendMonitor(sch.Done(), amsg.addr, sch.SendOutput())
 
+					s.runningCnt += 1
 				} else {
 					connId = v.ConnID()
 				}
@@ -216,7 +277,7 @@ func (s *server) mainLoop() {
 					continue
 				}
 
-				if v.Lost() {
+				if v.Lost(false) {
 					continue
 				}
 
@@ -230,10 +291,7 @@ func (s *server) mainLoop() {
 			s.schedulersMtx.Lock()
 			sch, ok := s.schedulers[c]
 			if ok {
-				sch.Cancel()
-				addr := sch.AddrStr()
-				delete(s.schedulers, c)
-				delete(s.schedulersWithAddr, addr)
+				sch.Close()
 			}
 			s.schedulersMtx.Unlock()
 		}
@@ -267,7 +325,7 @@ func (s *server) recvLoop() {
 
 		msg, addr, err := s.recvMessage(readBytes)
 		if err != nil {
-			log.WithError(err).Error("recvMessage failed")
+			log.WithError(err).Debug("recvMessage failed")
 			continue
 		}
 

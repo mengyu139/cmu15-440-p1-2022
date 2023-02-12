@@ -8,6 +8,14 @@ import (
 	"github.com/cmu440/lspnet"
 )
 
+type State int
+
+const (
+	StateRuning = 0
+	StateCloing = 1
+	StateClosed = 2
+)
+
 type MessageWithErr struct {
 	message *Message
 	err     error
@@ -23,6 +31,31 @@ type Scheduler struct {
 	params            *Params
 	lost              bool
 	sendMtx           sync.Mutex
+	closing           bool
+	closed            bool
+
+	state State
+}
+
+func (s *Scheduler) Close() {
+	s.sendMtx.Lock()
+	defer s.sendMtx.Unlock()
+
+	s.closing = true
+}
+
+func (s *Scheduler) Closing() bool {
+	s.sendMtx.Lock()
+	defer s.sendMtx.Unlock()
+
+	return s.closing
+}
+
+func (s *Scheduler) Closed() bool {
+	s.sendMtx.Lock()
+	defer s.sendMtx.Unlock()
+
+	return s.closed
 }
 
 func (s *Scheduler) Cancel() {
@@ -33,11 +66,38 @@ func (s *Scheduler) Done() <-chan struct{} {
 	return s.ctx.Done()
 }
 
-func (s *Scheduler) Tick() {
+func (s *Scheduler) State() State {
+	s.sendMtx.Lock()
+	defer s.sendMtx.Unlock()
+
+	return s.state
+}
+
+func (s *Scheduler) Tick() State {
 	s.sendMtx.Lock()
 	defer s.sendMtx.Unlock()
 
 	s.send.Tick()
+
+	// check closing
+	if s.closing {
+		// all pending msg are sent and acked
+		if s.send.unAckSn == 0 && s.send.sendList.Len() == 0 {
+			s.closed = true
+		}
+	}
+
+	if s.closed {
+		s.state = StateClosed
+		return StateClosed
+	}
+
+	if s.closing {
+		s.state = StateCloing
+		return StateCloing
+	}
+
+	return StateRuning
 }
 
 func (s *Scheduler) Ack(msg *Message) {
@@ -75,9 +135,13 @@ func (s *Scheduler) RecvOutput() <-chan *MessageWithErr {
 	return s.recv.Output()
 }
 
-func (s *Scheduler) Lost() bool {
+func (s *Scheduler) Lost(check bool) bool {
 	s.sendMtx.Lock()
 	defer s.sendMtx.Unlock()
+
+	if !check {
+		return s.lost
+	}
 
 	if s.lost {
 		return true
@@ -113,6 +177,7 @@ func NewScheduler(ctx context.Context, connId int, sn int, params *Params, addr 
 		addr:              addr,
 		lastRecvTimeStamp: time.Now(),
 		params:            params,
+		state:             StateRuning,
 	}
 	return c
 }
