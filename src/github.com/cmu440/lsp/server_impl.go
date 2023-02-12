@@ -34,6 +34,7 @@ type server struct {
 	g      *sync.WaitGroup
 
 	// epoch
+	epoch       int
 	epochTicker *time.Ticker
 
 	udpServer *lspnet.UDPConn
@@ -207,9 +208,11 @@ func (s *server) mainLoop() {
 		case <-s.ctx.Done():
 			return
 		case <-s.epochTicker.C:
+			s.epoch += 1
+
 			s.schedulersMtx.Lock()
 			for _, v := range s.schedulers {
-				state := v.Tick()
+				state := v.Tick(s.epoch)
 
 				if state == StateClosed {
 					log.WithField("connID", v.ConnID()).Info("closed")

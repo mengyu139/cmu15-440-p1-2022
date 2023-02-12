@@ -20,6 +20,9 @@ type SendScheduler struct {
 	outCh    chan *Message
 	ctx      context.Context
 	sendList *list.List
+
+	epoch         int
+	lastSendEpoch int
 }
 
 func NewSendScheduler(ctx context.Context, connId int, sn int, params *Params) *SendScheduler {
@@ -44,7 +47,9 @@ func NewSendScheduler(ctx context.Context, connId int, sn int, params *Params) *
 // timer
 // make backoff retry, retry msg will be send into outch
 // no transfer will be make
-func (s *SendScheduler) Tick() {
+func (s *SendScheduler) Tick(e int) {
+	s.epoch = e
+
 	for i := 0; i < s.params.WindowSize; i++ {
 		index := s.minAckSn + 1 + i
 		v, ok := s.windowMemo[index]
@@ -77,6 +82,12 @@ func (s *SendScheduler) Tick() {
 		v.lastTime = time.Now()
 		s.output(v.Message)
 	}
+
+	// heartbeat
+	if s.epoch-s.lastSendEpoch > 1 {
+		s.output(NewAck(s.connId, 0))
+	}
+
 }
 
 // ack
@@ -169,6 +180,7 @@ func (s *SendScheduler) output(msg *Message) {
 	case <-s.ctx.Done():
 		return
 	case s.outCh <- msg:
+		s.lastSendEpoch = s.epoch
 		return
 	}
 }

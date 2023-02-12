@@ -32,6 +32,7 @@ type client struct {
 	params  *Params
 
 	epoch         int
+	lastSendEpoch int
 	lastRecvEpoch int // lastest epoch stamp when recieve msg from server
 
 	readCh      chan *Message
@@ -153,9 +154,9 @@ func (c *client) mainLoop() {
 			c.sendSch.Send(payload)
 
 		case <-c.epochTicker.C:
-			c.sendSch.Tick()
+			c.sendSch.Tick(c.epoch)
 			c.epoch += 1
-			log.WithField("epoch", c.epoch).Info("tick...")
+			log.WithField("epoch", c.epoch).Debug("tick...")
 
 		case msg := <-c.readCh:
 			if msg == nil {
@@ -215,6 +216,7 @@ func (c *client) writeLoop() {
 		case <-c.ctx.Done():
 			return
 		case msg := <-c.sendSch.Output():
+			c.lastSendEpoch = c.epoch
 			writeMsg(c.conn, msg)
 		}
 
@@ -238,6 +240,7 @@ func writeMsg(conn *lspnet.UDPConn, msg *Message) error {
 	}
 
 	_, err = conn.Write(b)
+	log.WithField("msg", string(b)).Info("-> UPD")
 	return err
 }
 

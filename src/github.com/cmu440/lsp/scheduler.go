@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/cmu440/lspnet"
+	log "github.com/sirupsen/logrus"
 )
 
 type State int
@@ -33,8 +34,8 @@ type Scheduler struct {
 	sendMtx           sync.Mutex
 	closing           bool
 	closed            bool
-
-	state State
+	epoch             int
+	state             State
 }
 
 func (s *Scheduler) Close() {
@@ -73,11 +74,12 @@ func (s *Scheduler) State() State {
 	return s.state
 }
 
-func (s *Scheduler) Tick() State {
+func (s *Scheduler) Tick(e int) State {
 	s.sendMtx.Lock()
 	defer s.sendMtx.Unlock()
 
-	s.send.Tick()
+	s.epoch = e
+	s.send.Tick(e)
 
 	// check closing
 	if s.closing {
@@ -151,6 +153,7 @@ func (s *Scheduler) Lost(check bool) bool {
 	if time.Since(s.lastRecvTimeStamp).Milliseconds() > int64(s.params.EpochLimit)*int64(s.params.EpochMillis) {
 		if s.send.unAckSn == 0 && s.send.sendList.Len() == 0 {
 			lost = true
+			log.WithField("connId", s.connId).WithField("lastRecvTimeStamp", s.lastRecvTimeStamp).WithField("now", time.Now()).Error("timeout, the conn is lost")
 		}
 	}
 
