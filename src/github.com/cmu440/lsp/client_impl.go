@@ -264,7 +264,7 @@ func (c *client) Read() ([]byte, error) {
 	case <-c.ctx.Done():
 		return nil, errClientClosed
 	case msg := <-c.recvSch.Output():
-		return msg.Payload, nil
+		return msg.message.Payload, nil
 	}
 
 }

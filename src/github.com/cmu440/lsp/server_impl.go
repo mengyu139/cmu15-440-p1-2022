@@ -44,13 +44,10 @@ type server struct {
 	recvCh      chan *MessageWithAddr
 	closeConnCh chan int
 
-	// payload and connid from Write method
-	sendCh chan *Message
-
 	// read data from all schedluers
 	readCh chan *Message
 
-	dataForReadCh chan *Message
+	dataForReadCh chan *MessageWithErr
 
 	// data in this channel will be wtiten to udp directly
 	dataForWriteUPDCh chan *MessageWithAddr
@@ -93,11 +90,10 @@ func NewServer(port int, params *Params) (Server, error) {
 		udpServer:          udpServer,
 		recvCh:             make(chan *MessageWithAddr, 100),
 		closeConnCh:        make(chan int, 10),
-		sendCh:             make(chan *Message, 10),
 		schedulers:         make(map[int]*Scheduler),
 		schedulersWithAddr: make(map[string]*Scheduler),
 		readCh:             make(chan *Message, 100),
-		dataForReadCh:      make(chan *Message, 1000),
+		dataForReadCh:      make(chan *MessageWithErr, 1000),
 		dataForWriteUPDCh:  make(chan *MessageWithAddr, 1000),
 	}
 
@@ -115,12 +111,18 @@ func (s *server) Read() (int, []byte, error) {
 		return 0, nil, errClientClosed
 
 	case msg := <-s.dataForReadCh:
-		return len(msg.Payload), msg.Payload, nil
+		return msg.message.ConnID, msg.message.Payload, msg.err
 	}
 }
 
 func (s *server) Write(connId int, payload []byte) error {
-	// lost?
+	select {
+	case <-s.ctx.Done():
+		return errClientClosed
+
+	default:
+	}
+
 	s.schedulersMtx.Lock()
 	v, ok := s.schedulers[connId]
 	s.schedulersMtx.Unlock()
@@ -131,16 +133,7 @@ func (s *server) Write(connId int, payload []byte) error {
 	if v.Lost() {
 		return errClientLost
 	}
-
-	select {
-	case <-s.ctx.Done():
-		return errClientClosed
-
-	case s.sendCh <- &Message{
-		Payload: payload,
-		ConnID:  connId,
-	}:
-	}
+	v.Send(payload)
 
 	return nil
 }
@@ -182,6 +175,7 @@ func (s *server) mainLoop() {
 			return
 		case <-s.epochTimer.C:
 			for _, v := range s.schedulers {
+				v.Lost()
 				v.Tick()
 			}
 
@@ -212,6 +206,7 @@ func (s *server) mainLoop() {
 				s.ackBack(amsg.addr, connId, amsg.message.SeqNum)
 
 			} else {
+				// ack or data
 				s.schedulersMtx.Lock()
 				addr := amsg.addr.String()
 				v, ok := s.schedulersWithAddr[addr]
@@ -220,6 +215,11 @@ func (s *server) mainLoop() {
 				if !ok {
 					continue
 				}
+
+				if v.Lost() {
+					continue
+				}
+
 				if amsg.message.Type == MsgData {
 					v.Recv(amsg.message)
 				} else if amsg.message.Type == MsgAck || amsg.message.Type == MsgCAck {
@@ -236,15 +236,6 @@ func (s *server) mainLoop() {
 				delete(s.schedulersWithAddr, addr)
 			}
 			s.schedulersMtx.Unlock()
-
-		case smsg := <-s.sendCh:
-			s.schedulersMtx.Lock()
-			sch, ok := s.schedulers[smsg.ConnID]
-			s.schedulersMtx.Unlock()
-
-			if ok {
-				sch.Send(smsg.Payload)
-			}
 		}
 	}
 }
@@ -313,7 +304,7 @@ func (s *server) writeLoop() {
 	}
 }
 
-func (s *server) readMonitor(done <-chan struct{}, dataCh <-chan *Message) {
+func (s *server) readMonitor(done <-chan struct{}, dataCh <-chan *MessageWithErr) {
 	for {
 		select {
 		case <-done:

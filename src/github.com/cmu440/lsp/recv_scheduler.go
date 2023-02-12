@@ -7,7 +7,7 @@ import (
 )
 
 type RecvScheduler struct {
-	dataBuffer chan *Message
+	dataBuffer chan *MessageWithErr
 
 	// key: sn
 	dataPool map[int]*Message
@@ -16,13 +16,12 @@ type RecvScheduler struct {
 	params     *Params
 	ctx        context.Context
 	connId     int
-	outCh      chan *Message
 }
 
 func NewRecvScheduler(ctx context.Context, connId int, sn int, params *Params) *RecvScheduler {
 	r := &RecvScheduler{
 		nextRecvSn: sn + 1,
-		outCh:      make(chan *Message, 1000),
+		dataBuffer: make(chan *MessageWithErr, 1000),
 		connId:     connId,
 		ctx:        ctx,
 		params:     params,
@@ -57,15 +56,24 @@ func (c *RecvScheduler) Recv(msg *Message) {
 }
 
 // retrive data msg
-func (s *RecvScheduler) Output() <-chan *Message {
-	return s.outCh
+func (s *RecvScheduler) Output() <-chan *MessageWithErr {
+	return s.dataBuffer
+}
+
+func (c *RecvScheduler) EndWithAErr() {
+	select {
+	case <-c.ctx.Done():
+		return
+	case c.dataBuffer <- &MessageWithErr{message: &Message{ConnID: c.connId}, err: errClientLost}:
+		return
+	}
 }
 
 func (c *RecvScheduler) pushIntoBuffer(msg *Message) error {
 	select {
 	case <-c.ctx.Done():
 		return errClientClosed
-	case c.dataBuffer <- msg:
+	case c.dataBuffer <- &MessageWithErr{message: msg}:
 		return nil
 	}
 }
