@@ -193,7 +193,7 @@ func (s *SendScheduler) transfer() {
 
 	// remove it!
 	s.sendList.Remove(elm)
-	log.WithField("unAckSn", s.unAckSn).WithField("pending len", s.sendList.Len()).Info("window")
+	log.WithField("unAckSn", s.unAckSn).WithField("pending len", s.sendList.Len()).Debug("window")
 }
 
 func (s *SendScheduler) output(msg *Message) {

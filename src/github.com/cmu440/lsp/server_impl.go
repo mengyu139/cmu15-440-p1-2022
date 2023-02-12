@@ -308,7 +308,7 @@ func (s *server) ackBack(addr *lspnet.UDPAddr, connId int, sn int) error {
 	case s.dataForWriteUPDCh <- amsg:
 		log.WithFields(log.Fields{
 			"msg": msg,
-		}).Info("ack back")
+		}).Debug("ack back")
 	}
 	return nil
 }
@@ -338,7 +338,7 @@ func (s *server) recvLoop() {
 		case <-s.ctx.Done():
 			return
 		case s.recvCh <- NewMessageWithAddr(msg, addr):
-			log.WithField("msg", msg).Info("msg to recvCh")
+			log.WithField("msg", msg).Debug("msg to recvCh")
 		}
 
 	}
@@ -365,7 +365,7 @@ func (s *server) writeLoop() {
 				continue
 			}
 
-			log.WithField("msg", amsg.message).Info("write udp")
+			log.WithField("msg", amsg.message).Debug("write udp")
 		}
 	}
 }

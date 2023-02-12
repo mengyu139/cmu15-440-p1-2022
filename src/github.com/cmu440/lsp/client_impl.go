@@ -131,7 +131,7 @@ func NewClient(hostport string, initialSeqNum int, params *Params) (Client, erro
 		g:           &sync.WaitGroup{},
 	}
 
-	log.WithField("params", params).Info("init client")
+	log.WithField("params", params).Debug("init client")
 
 	c.g.Add(3)
 	go c.mainLoop()
@@ -228,7 +228,7 @@ func (c *client) ackBack(connId int, sn int) error {
 	case c.writeCh <- msg:
 		log.WithFields(log.Fields{
 			"msg": msg,
-		}).Info("ack back")
+		}).Debug("ack back")
 		return nil
 	}
 }
