@@ -42,8 +42,7 @@ type server struct {
 	curConnId int
 
 	// recv data from udp
-	recvCh      chan *MessageWithAddr
-	closeConnCh chan int
+	recvCh chan *MessageWithAddr
 
 	// read data from all schedluers
 	readCh chan *Message
@@ -61,6 +60,7 @@ type server struct {
 	schedulersWithAddr map[string]*Scheduler
 
 	runningCnt int
+	closeCh    chan int
 	closing    bool
 	closed     chan int
 }
@@ -94,13 +94,13 @@ func NewServer(port int, params *Params) (Server, error) {
 		g:                  &sync.WaitGroup{},
 		udpServer:          udpServer,
 		recvCh:             make(chan *MessageWithAddr, 100),
-		closeConnCh:        make(chan int, 10),
 		schedulers:         make(map[int]*Scheduler),
 		schedulersWithAddr: make(map[string]*Scheduler),
 		readCh:             make(chan *Message, 100),
 		dataForReadCh:      make(chan *MessageWithErr, 1000),
 		dataForWriteUPDCh:  make(chan *MessageWithAddr, 1000),
 		closed:             make(chan int),
+		closeCh:            make(chan int),
 	}
 
 	s.g.Add(3)
@@ -130,30 +130,18 @@ func (s *server) Write(connId int, payload []byte) error {
 	}
 
 	s.schedulersMtx.Lock()
-	v, ok := s.schedulers[connId]
-	s.schedulersMtx.Unlock()
+	defer s.schedulersMtx.Unlock()
 
+	v, ok := s.schedulers[connId]
 	if !ok {
 		return errClientClosed
 	}
-	if v.Lost(false) {
-		return errClientLost
-	}
+	return v.Send(payload)
 
-	if v.Closing() {
-		return errClientClosing
-	}
-	if v.Closed() {
-		return errClientClosed
-	}
-
-	v.Send(payload)
-
-	return nil
 }
 
+// non-blocking
 func (s *server) CloseConn(connId int) error {
-
 	select {
 	case <-s.ctx.Done():
 		return errClientClosed
@@ -161,12 +149,14 @@ func (s *server) CloseConn(connId int) error {
 	}
 
 	s.schedulersMtx.Lock()
-	_, ok := s.schedulers[connId]
-	s.schedulersMtx.Unlock()
-
+	defer s.schedulersMtx.Unlock()
+	v, ok := s.schedulers[connId]
 	if !ok {
 		return errClientClosed
 	}
+
+	// set the closing flag, and wait tick trigger the client to be closed
+	v.Close()
 
 	return nil
 
@@ -176,24 +166,18 @@ func (s *server) Close() error {
 	select {
 	case <-s.ctx.Done():
 		return errClientClosed
+	case s.closeCh <- 1:
 	default:
 	}
 
-	// close all conn
-	s.schedulersMtx.Lock()
-	for _, v := range s.schedulers {
-		state := v.State()
-		if state == StateRuning {
-			log.WithField("connID", v.ConnID()).Info("is closing")
-			v.Close()
-		}
-	}
-	s.schedulersMtx.Unlock()
-
-	// wait for closed signal
+	// block for closed signal
 	select {
 	case <-s.closed:
 	}
+
+	s.cancel()
+
+	s.g.Wait()
 
 	// stop server
 	return s.udpServer.Close()
@@ -212,9 +196,9 @@ func (s *server) mainLoop() {
 
 			s.schedulersMtx.Lock()
 			for _, v := range s.schedulers {
-				state := v.Tick(s.epoch)
+				v.Tick(s.epoch)
 
-				if state == StateClosed {
+				if v.State() == StateClosed {
 					log.WithField("connID", v.ConnID()).Info("closed")
 
 					v.Cancel()
@@ -224,82 +208,92 @@ func (s *server) mainLoop() {
 					s.runningCnt -= 1
 					continue
 				}
-
-				// check lost
-				v.Lost(true)
-
 			}
 			s.schedulersMtx.Unlock()
 
-			// close
-			select {
-			case <-s.closed:
-				log.Info("server is closed")
-			default:
-				if s.closing && s.runningCnt == 0 {
-					close(s.closed)
-					log.Info("all running scheduler are closed, server is ready to be close")
+			// check all closed
+			s.checkClosed()
+
+		case <-s.closeCh:
+			// close all conn, set closing and wait for closed
+			s.schedulersMtx.Lock()
+			for _, v := range s.schedulers {
+				state := v.State()
+				if state == StateRuning {
+					log.WithField("connID", v.ConnID()).Info("is closing")
+					v.Close()
 				}
 			}
+			s.schedulersMtx.Unlock()
 
 		case amsg := <-s.recvCh:
 			if amsg.message.Type == MsgConnect {
-				addr := amsg.addr.String()
-				connId := 0
-				v, ok := s.schedulersWithAddr[addr]
-				if !ok {
-					// memo
-					connId = s.assignConnId()
-					sch := NewScheduler(s.ctx, connId, amsg.message.SeqNum, s.params, amsg.addr)
-
-					s.schedulersMtx.Lock()
-					s.schedulers[connId] = sch
-					s.schedulersWithAddr[addr] = sch
-					s.schedulersMtx.Unlock()
-
-					// monitor
-					go s.readMonitor(sch.Done(), sch.RecvOutput())
-					go s.sendMonitor(sch.Done(), amsg.addr, sch.SendOutput())
-
-					s.runningCnt += 1
-				} else {
-					connId = v.ConnID()
-				}
-
-				//send ack back
-				s.ackBack(amsg.addr, connId, amsg.message.SeqNum)
-
+				s.processConnectMsg(amsg)
 			} else {
-				// ack or data
-				s.schedulersMtx.Lock()
-				addr := amsg.addr.String()
-				v, ok := s.schedulersWithAddr[addr]
-				s.schedulersMtx.Unlock()
-
-				if !ok {
-					continue
-				}
-
-				if v.Lost(false) {
-					continue
-				}
-
-				if amsg.message.Type == MsgData {
-					v.Recv(amsg.message)
-					// ack back
-					s.ackBack(amsg.addr, amsg.message.ConnID, amsg.message.SeqNum)
-
-				} else if amsg.message.Type == MsgAck || amsg.message.Type == MsgCAck {
-					v.Ack(amsg.message)
-				}
+				s.processAckOrDataMsg(amsg)
 			}
-		case c := <-s.closeConnCh:
-			s.schedulersMtx.Lock()
-			sch, ok := s.schedulers[c]
-			if ok {
-				sch.Close()
-			}
-			s.schedulersMtx.Unlock()
+
+		}
+	}
+}
+
+func (s *server) processAckOrDataMsg(amsg *MessageWithAddr) {
+	// ack or data
+	s.schedulersMtx.Lock()
+	addr := amsg.addr.String()
+	v, ok := s.schedulersWithAddr[addr]
+	s.schedulersMtx.Unlock()
+
+	if !ok {
+		return
+	}
+
+	if amsg.message.Type == MsgData {
+		v.Recv(amsg.message)
+		// ack back
+		s.ackBack(amsg.addr, amsg.message.ConnID, amsg.message.SeqNum)
+
+	} else if amsg.message.Type == MsgAck || amsg.message.Type == MsgCAck {
+		v.Ack(amsg.message)
+	}
+}
+
+func (s *server) processConnectMsg(amsg *MessageWithAddr) {
+	addr := amsg.addr.String()
+	connId := 0
+	v, ok := s.schedulersWithAddr[addr]
+	if !ok {
+		// memo
+		connId = s.assignConnId()
+		sch := NewScheduler(s.ctx, connId, amsg.message.SeqNum, s.params, amsg.addr)
+
+		s.schedulersMtx.Lock()
+		s.schedulers[connId] = sch
+		s.schedulersWithAddr[addr] = sch
+		s.schedulersMtx.Unlock()
+
+		// monitor
+		go s.readMonitor(sch.Done(), sch.RecvOutput())
+		go s.sendMonitor(sch.Done(), amsg.addr, sch.SendOutput())
+
+		s.runningCnt += 1
+	} else {
+		connId = v.ConnID()
+	}
+
+	//send ack back
+	s.ackBack(amsg.addr, connId, amsg.message.SeqNum)
+
+}
+
+func (s *server) checkClosed() {
+	select {
+	case <-s.closed:
+		log.Info("server is closed")
+	default:
+		if s.closing && s.runningCnt == 0 {
+			close(s.closed)
+			log.Info("all running scheduler are closed, server is ready to be close")
 		}
 	}
 }

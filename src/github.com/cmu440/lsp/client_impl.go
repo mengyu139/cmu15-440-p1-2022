@@ -27,9 +27,10 @@ type client struct {
 	conn   *lspnet.UDPConn
 	connID int
 
-	sendSch *SendScheduler
-	recvSch *RecvScheduler
-	params  *Params
+	// sendSch   *SendScheduler
+	// recvSch   *RecvScheduler
+	scheduler *Scheduler
+	params    *Params
 
 	epoch         int
 	lastSendEpoch int
@@ -121,8 +122,7 @@ func NewClient(hostport string, initialSeqNum int, params *Params) (Client, erro
 		cancel:      cancel,
 		connID:      connID,
 		conn:        conn,
-		sendSch:     NewSendScheduler(ctx, connID, initialSeqNum, params),
-		recvSch:     NewRecvScheduler(ctx, connID, initialSeqNum, params),
+		scheduler:   NewScheduler(ctx, connID, initialSeqNum, params, addr),
 		params:      params,
 		readCh:      make(chan *Message, 1000),
 		writeCh:     make(chan *Message, 100),
@@ -141,6 +141,44 @@ func NewClient(hostport string, initialSeqNum int, params *Params) (Client, erro
 	return c, nil
 }
 
+func (c *client) ConnID() int {
+	return c.connID
+}
+
+func (c *client) Read() ([]byte, error) {
+	select {
+	case <-c.ctx.Done():
+		return nil, errClientClosed
+	case amsg := <-c.scheduler.RecvOutput():
+		if amsg.err != nil {
+			return nil, amsg.err
+		}
+		return amsg.message.Payload, nil
+	}
+
+}
+
+func (c *client) Write(payload []byte) error {
+	select {
+	case <-c.ctx.Done():
+		return errClientClosed
+	case c.sendCh <- payload:
+		return nil
+	}
+}
+
+func (c *client) Close() error {
+	select {
+	case <-c.ctx.Done():
+		return errClientClosed
+	default:
+	}
+
+	c.cancel()
+	c.conn.Close()
+	return nil
+}
+
 func (c *client) mainLoop() {
 	defer c.g.Done()
 	defer log.Info("exit mainLoop")
@@ -151,10 +189,10 @@ func (c *client) mainLoop() {
 			return
 
 		case payload := <-c.sendCh:
-			c.sendSch.Send(payload)
+			c.scheduler.Send(payload)
 
 		case <-c.epochTicker.C:
-			c.sendSch.Tick(c.epoch)
+			c.scheduler.Tick(c.epoch)
 			c.epoch += 1
 			log.WithField("epoch", c.epoch).Debug("tick...")
 
@@ -165,12 +203,12 @@ func (c *client) mainLoop() {
 			c.lastRecvEpoch = c.epoch
 
 			if msg.Type == MsgAck || msg.Type == MsgCAck {
-				c.sendSch.Ack(msg)
+				c.scheduler.Ack(msg)
 				continue
 			}
 
 			if msg.Type == MsgData {
-				c.recvSch.Recv(msg)
+				c.scheduler.Recv(msg)
 
 				// send ack back
 				c.ackBack(c.connID, msg.SeqNum)
@@ -229,7 +267,7 @@ func (c *client) writeLoop() {
 		select {
 		case <-c.ctx.Done():
 			return
-		case msg := <-c.sendSch.Output():
+		case msg := <-c.scheduler.SendOutput():
 			c.lastSendEpoch = c.epoch
 			writeUDP(c.params, c.conn, msg)
 
@@ -272,39 +310,4 @@ func recvMessage(conn *lspnet.UDPConn, readBytes []byte, params *Params) (*Messa
 		return nil, err
 	}
 	return &msg, nil
-}
-
-func (c *client) ConnID() int {
-	return c.connID
-}
-
-func (c *client) Read() ([]byte, error) {
-	select {
-	case <-c.ctx.Done():
-		return nil, errClientClosed
-	case msg := <-c.recvSch.Output():
-		return msg.message.Payload, nil
-	}
-
-}
-
-func (c *client) Write(payload []byte) error {
-	select {
-	case <-c.ctx.Done():
-		return errClientClosed
-	case c.sendCh <- payload:
-		return nil
-	}
-}
-
-func (c *client) Close() error {
-	select {
-	case <-c.ctx.Done():
-		return errClientClosed
-	default:
-	}
-
-	c.cancel()
-	c.conn.Close()
-	return nil
 }

@@ -22,8 +22,9 @@ type MessageWithErr struct {
 	err     error
 }
 type Scheduler struct {
-	addr              *lspnet.UDPAddr
-	connId            int
+	addr   *lspnet.UDPAddr
+	connId int
+	// 发送
 	send              *SendScheduler
 	recv              *RecvScheduler
 	ctx               context.Context
@@ -39,24 +40,8 @@ type Scheduler struct {
 }
 
 func (s *Scheduler) Close() {
-	s.sendMtx.Lock()
-	defer s.sendMtx.Unlock()
-
 	s.closing = true
-}
-
-func (s *Scheduler) Closing() bool {
-	s.sendMtx.Lock()
-	defer s.sendMtx.Unlock()
-
-	return s.closing
-}
-
-func (s *Scheduler) Closed() bool {
-	s.sendMtx.Lock()
-	defer s.sendMtx.Unlock()
-
-	return s.closed
+	s.state = StateCloing
 }
 
 func (s *Scheduler) Cancel() {
@@ -68,38 +53,19 @@ func (s *Scheduler) Done() <-chan struct{} {
 }
 
 func (s *Scheduler) State() State {
-	s.sendMtx.Lock()
-	defer s.sendMtx.Unlock()
-
 	return s.state
 }
 
-func (s *Scheduler) Tick(e int) State {
+func (s *Scheduler) Tick(e int) {
 	s.sendMtx.Lock()
 	defer s.sendMtx.Unlock()
 
 	s.epoch = e
 	s.send.Tick(e)
 
-	// check closing
-	if s.closing {
-		// all pending msg are sent and acked
-		if s.send.unAckSn == 0 && s.send.sendList.Len() == 0 {
-			s.closed = true
-		}
-	}
+	s.lostCheck()
+	s.closeCheck()
 
-	if s.closed {
-		s.state = StateClosed
-		return StateClosed
-	}
-
-	if s.closing {
-		s.state = StateCloing
-		return StateCloing
-	}
-
-	return StateRuning
 }
 
 func (s *Scheduler) Ack(msg *Message) {
@@ -110,11 +76,22 @@ func (s *Scheduler) Ack(msg *Message) {
 	s.lastRecvTimeStamp = time.Now()
 }
 
-func (s *Scheduler) Send(payload []byte) {
+func (s *Scheduler) Send(payload []byte) error {
 	s.sendMtx.Lock()
 	defer s.sendMtx.Unlock()
 
+	if s.lost {
+		return errClientLost
+	}
+	if s.closing {
+		return errClientClosing
+	}
+	if s.closed {
+		return errClientClosed
+	}
+
 	s.send.Send(payload)
+	return nil
 }
 
 func (s *Scheduler) Recv(msg *Message) {
@@ -137,14 +114,21 @@ func (s *Scheduler) RecvOutput() <-chan *MessageWithErr {
 	return s.recv.Output()
 }
 
-func (s *Scheduler) Lost(check bool) bool {
-	s.sendMtx.Lock()
-	defer s.sendMtx.Unlock()
+func (s *Scheduler) IsLost() bool {
+	return s.lost
+}
 
-	if !check {
-		return s.lost
+func (s *Scheduler) closeCheck() {
+	if s.closing {
+		// all pending msg are sent and acked
+		if s.send.unAckSn == 0 && s.send.sendList.Len() == 0 {
+			s.closed = true
+			s.state = StateClosed
+		}
 	}
+}
 
+func (s *Scheduler) lostCheck() bool {
 	if s.lost {
 		return true
 	}
