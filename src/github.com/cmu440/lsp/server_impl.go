@@ -56,6 +56,8 @@ type server struct {
 	dataForWriteUPDCh chan *MessageWithAddr
 
 	// key: connId
+	schedulersMtx sync.Mutex
+
 	schedulers map[int]*Scheduler
 	// key: addr string
 	schedulersWithAddr map[string]*Scheduler
@@ -118,6 +120,18 @@ func (s *server) Read() (int, []byte, error) {
 }
 
 func (s *server) Write(connId int, payload []byte) error {
+	// lost?
+	s.schedulersMtx.Lock()
+	v, ok := s.schedulers[connId]
+	s.schedulersMtx.Unlock()
+
+	if !ok {
+		return errClientClosed
+	}
+	if v.Lost() {
+		return errClientLost
+	}
+
 	select {
 	case <-s.ctx.Done():
 		return errClientClosed
@@ -128,11 +142,6 @@ func (s *server) Write(connId int, payload []byte) error {
 	}:
 	}
 
-	// cli, ok := s.clients[connId]
-	// if !ok {
-	// 	return fmt.Errorf("connid:%v not found", connId)
-	// }
-	// return cli.Send(payload)
 	return nil
 }
 
@@ -185,8 +194,11 @@ func (s *server) mainLoop() {
 					// memo
 					connId = s.assignConnId()
 					sch := NewScheduler(s.ctx, connId, amsg.message.SeqNum, s.params, amsg.addr)
+
+					s.schedulersMtx.Lock()
 					s.schedulers[connId] = sch
 					s.schedulersWithAddr[addr] = sch
+					s.schedulersMtx.Unlock()
 
 					// monitor
 					go s.readMonitor(sch.Done(), sch.RecvOutput())
@@ -199,21 +211,23 @@ func (s *server) mainLoop() {
 				//send ack back
 				s.ackBack(amsg.addr, connId, amsg.message.SeqNum)
 
-			} else if amsg.message.Type == MsgData {
+			} else {
+				s.schedulersMtx.Lock()
 				addr := amsg.addr.String()
 				v, ok := s.schedulersWithAddr[addr]
-				if ok {
-					v.Recv(amsg.message)
+				s.schedulersMtx.Unlock()
+
+				if !ok {
+					continue
 				}
-			} else if amsg.message.Type == MsgAck || amsg.message.Type == MsgCAck {
-				addr := amsg.addr.String()
-				v, ok := s.schedulersWithAddr[addr]
-				if ok {
+				if amsg.message.Type == MsgData {
+					v.Recv(amsg.message)
+				} else if amsg.message.Type == MsgAck || amsg.message.Type == MsgCAck {
 					v.Ack(amsg.message)
 				}
 			}
-
 		case c := <-s.closeConnCh:
+			s.schedulersMtx.Lock()
 			sch, ok := s.schedulers[c]
 			if ok {
 				sch.Cancel()
@@ -221,9 +235,13 @@ func (s *server) mainLoop() {
 				delete(s.schedulers, c)
 				delete(s.schedulersWithAddr, addr)
 			}
+			s.schedulersMtx.Unlock()
 
 		case smsg := <-s.sendCh:
+			s.schedulersMtx.Lock()
 			sch, ok := s.schedulers[smsg.ConnID]
+			s.schedulersMtx.Unlock()
+
 			if ok {
 				sch.Send(smsg.Payload)
 			}
