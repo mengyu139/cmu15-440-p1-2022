@@ -9,7 +9,7 @@ const (
 	DefaultEpochLimit         = 5
 	DefaultEpochMillis        = 2000
 	DefaultWindowSize         = 1
-	DefaultMaxBackOffInterval = 0
+	DefaultMaxBackOffInterval = 3
 	DefaultMaxUnackedMessages = 1
 )
 

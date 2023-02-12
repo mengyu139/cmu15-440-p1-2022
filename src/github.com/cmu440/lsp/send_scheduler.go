@@ -4,6 +4,8 @@ import (
 	"container/list"
 	"context"
 	"time"
+
+	log "github.com/sirupsen/logrus"
 )
 
 type SendScheduler struct {
@@ -51,12 +53,18 @@ func (s *SendScheduler) Tick(e int) {
 	s.epoch = e
 
 	for i := 0; i < s.params.WindowSize; i++ {
+		if s.unAckSn == 0 {
+			break
+		}
+
 		index := s.minAckSn + 1 + i
 		v, ok := s.windowMemo[index]
 		if !ok {
+			log.WithField("sn", index).Info("not found in window")
 			break
 		}
 		if v == nil {
+			log.WithField("sn", index).Info("is nil")
 			continue
 		}
 		if v.timeout {
@@ -64,7 +72,12 @@ func (s *SendScheduler) Tick(e int) {
 			continue
 		}
 
-		if time.Since(v.lastTime).Milliseconds() < int64(s.params.EpochMillis)*int64(v.curBackoff) {
+		t := time.Since(v.lastTime).Milliseconds()
+		target := int64(s.params.EpochMillis) * int64(v.curBackoff+1)
+		logger := log.WithField("cur milli", t).WithField("last time", v.lastTime).WithField("curBackoff", v.curBackoff).WithField("target", target)
+
+		if t < target {
+			logger.Debug("time too close, continue, no retry")
 			continue
 		}
 
@@ -75,11 +88,13 @@ func (s *SendScheduler) Tick(e int) {
 		}
 		if v.curBackoff > s.params.MaxBackOffInterval {
 			v.timeout = true
+			logger.Error("timeout")
 			continue
 		}
 
 		//resend
 		v.lastTime = time.Now()
+		log.WithField("sn", v.Message.SeqNum).Info("resend")
 		s.output(v.Message)
 	}
 
@@ -173,6 +188,7 @@ func (s *SendScheduler) transfer() {
 
 	// remove it!
 	s.sendList.Remove(elm)
+	log.WithField("unAckSn", s.unAckSn).WithField("pending len", s.sendList.Len()).Info("window")
 }
 
 func (s *SendScheduler) output(msg *Message) {

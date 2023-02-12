@@ -241,7 +241,7 @@ func writeMsg(params *Params, conn *lspnet.UDPConn, msg *Message) error {
 		return err
 	}
 
-	logger := log.WithField("msg", string(b)).WithField("->", "UPD")
+	logger := log.WithField("type", msg.Type).WithField("sn", msg.SeqNum).WithField("->", "UPD")
 
 	_, err = conn.Write(b)
 	if err != nil {
