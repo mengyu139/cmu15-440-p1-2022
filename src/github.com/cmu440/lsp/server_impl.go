@@ -234,9 +234,9 @@ func (s *server) mainLoop() {
 				log.Info("server is closed")
 			default:
 				if s.closing && s.runningCnt == 0 {
+					close(s.closed)
 					log.Info("all running scheduler are closed, server is ready to be close")
 				}
-				close(s.closed)
 			}
 
 		case amsg := <-s.recvCh:
