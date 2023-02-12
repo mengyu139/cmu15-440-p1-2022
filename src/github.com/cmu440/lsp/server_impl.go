@@ -320,6 +320,8 @@ func (s *server) recvLoop() {
 	readBytes := make([]byte, MAXN)
 
 	for {
+		log.Info("recvLoop wait msg ...")
+
 		select {
 		case <-s.ctx.Done():
 			return
@@ -411,6 +413,7 @@ func (c *server) recvMessage(readBytes []byte) (*Message, *lspnet.UDPAddr, error
 	}
 	var msg Message
 	if err = json.Unmarshal(readBytes[:readSize], &msg); err != nil {
+		log.WithError(err).Error("Unmarshal msg failed")
 		return nil, nil, err
 	}
 	return &msg, rAddr, nil

@@ -217,7 +217,7 @@ func (c *client) writeLoop() {
 			return
 		case msg := <-c.sendSch.Output():
 			c.lastSendEpoch = c.epoch
-			writeMsg(c.conn, msg)
+			writeMsg(c.params, c.conn, msg)
 		}
 
 	}
@@ -232,15 +232,23 @@ func (c *client) addMsgToWriteCh(msg *Message) error {
 	}
 }
 
-func writeMsg(conn *lspnet.UDPConn, msg *Message) error {
+func writeMsg(params *Params, conn *lspnet.UDPConn, msg *Message) error {
+	conn.SetDeadline(time.Now().Add(time.Millisecond * time.Duration(params.EpochMillis)))
+
 	b, err := json.Marshal(msg)
 	if err != nil {
 		log.WithError(err).Error("marshal msg failed")
 		return err
 	}
 
+	logger := log.WithField("msg", string(b)).WithField("->", "UPD")
+
 	_, err = conn.Write(b)
-	log.WithField("msg", string(b)).Info("-> UPD")
+	if err != nil {
+		logger.WithError(err).Error("Write UDP failed")
+
+	}
+	logger.Info("writed")
 	return err
 }
 
