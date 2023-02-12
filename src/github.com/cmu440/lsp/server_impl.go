@@ -5,7 +5,6 @@ package lsp
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -15,8 +14,15 @@ import (
 )
 
 type MessageWithAddr struct {
-	Message *Message
-	Addr    *lspnet.UDPAddr
+	message *Message
+	addr    *lspnet.UDPAddr
+}
+
+func NewMessageWithAddr(msg *Message, addr *lspnet.UDPAddr) *MessageWithAddr {
+	return &MessageWithAddr{
+		message: msg,
+		addr:    addr,
+	}
 }
 
 type server struct {
@@ -32,16 +38,27 @@ type server struct {
 
 	udpServer *lspnet.UDPConn
 
-	// key: connId
-	clients map[int]*CommonClient
-
-	// key: addr string
-	clientMemo map[string]int
-
 	curConnId int
 
-	// recv msg from all clients
-	recvMsgCh chan *MessageWithAddr
+	// recv data from udp
+	recvCh      chan *MessageWithAddr
+	closeConnCh chan int
+
+	// payload and connid from Write method
+	sendCh chan *Message
+
+	// read data from all schedluers
+	readCh chan *Message
+
+	dataForReadCh chan *Message
+
+	// data in this channel will be wtiten to udp directly
+	dataForWriteUPDCh chan *MessageWithAddr
+
+	// key: connId
+	schedulers map[int]*Scheduler
+	// key: addr string
+	schedulersWithAddr map[string]*Scheduler
 }
 
 // NewServer creates, initiates, and returns a new server. This function should
@@ -51,7 +68,7 @@ type server struct {
 // project 0, etc.) and immediately return. It should return a non-nil error if
 // there was an error resolving or listening on the specified port number.
 func NewServer(port int, params *Params) (Server, error) {
-	addr, err := lspnet.ResolveUDPAddr("udp", lspnet.JoinHostPort(":", fmt.Sprintf("%v", port)))
+	addr, err := lspnet.ResolveUDPAddr("udp", lspnet.JoinHostPort("", fmt.Sprintf("%v", port)))
 	if err != nil {
 		log.WithError(err).Error("ResolveUDPAddr failed")
 		return nil, err
@@ -65,56 +82,68 @@ func NewServer(port int, params *Params) (Server, error) {
 	ctx, cancel := context.WithCancel(context.TODO())
 
 	s := &server{
-		ctx:        ctx,
-		cancel:     cancel,
-		port:       port,
-		params:     params,
-		epochTimer: time.NewTimer(time.Millisecond * time.Duration(params.EpochMillis)),
-		g:          &sync.WaitGroup{},
-		udpServer:  udpServer,
-		recvMsgCh:  make(chan *MessageWithAddr, 100),
+		ctx:                ctx,
+		cancel:             cancel,
+		port:               port,
+		params:             params,
+		epochTimer:         time.NewTimer(time.Millisecond * time.Duration(params.EpochMillis)),
+		g:                  &sync.WaitGroup{},
+		udpServer:          udpServer,
+		recvCh:             make(chan *MessageWithAddr, 100),
+		closeConnCh:        make(chan int, 10),
+		sendCh:             make(chan *Message, 10),
+		schedulers:         make(map[int]*Scheduler),
+		schedulersWithAddr: make(map[string]*Scheduler),
+		readCh:             make(chan *Message, 100),
+		dataForReadCh:      make(chan *Message, 1000),
+		dataForWriteUPDCh:  make(chan *MessageWithAddr, 1000),
 	}
 
-	s.g.Add(2)
+	s.g.Add(3)
 	go s.mainLoop()
-	go s.recvMsgLoop()
+	go s.recvLoop()
+	go s.writeLoop()
 
 	return s, nil
 }
 
 func (s *server) Read() (int, []byte, error) {
-	// TODO: remove this line when you are ready to begin implementing this method.
-	select {} // Blocks indefinitely.
-	return -1, nil, errors.New("not yet implemented")
+	select {
+	case <-s.ctx.Done():
+		return 0, nil, errClientClosed
+
+	case msg := <-s.dataForReadCh:
+		return len(msg.Payload), msg.Payload, nil
+	}
 }
 
 func (s *server) Write(connId int, payload []byte) error {
 	select {
 	case <-s.ctx.Done():
 		return errClientClosed
-	default:
+
+	case s.sendCh <- &Message{
+		Payload: payload,
+		ConnID:  connId,
+	}:
 	}
 
-	cli, ok := s.clients[connId]
-	if !ok {
-		return fmt.Errorf("connid:%v not found", connId)
-	}
-	return cli.Send(payload)
+	// cli, ok := s.clients[connId]
+	// if !ok {
+	// 	return fmt.Errorf("connid:%v not found", connId)
+	// }
+	// return cli.Send(payload)
+	return nil
 }
 
 func (s *server) CloseConn(connId int) error {
 	select {
 	case <-s.ctx.Done():
 		return errClientClosed
-	default:
+	case s.closeConnCh <- connId:
 	}
 
-	cli, ok := s.clients[connId]
-	if !ok {
-		return fmt.Errorf("connId not found")
-	}
-
-	return cli.Close()
+	return nil
 
 }
 
@@ -134,69 +163,92 @@ func (s *server) Close() error {
 	return s.udpServer.Close()
 }
 
-func (s *server) mainLoop() error {
+func (s *server) mainLoop() {
 	defer s.g.Done()
+	defer log.Info("exit mainLoop")
+
 	for {
 		select {
 		case <-s.ctx.Done():
-			return errClientClosed
+			return
 		case <-s.epochTimer.C:
-			// check every client, stop and delete it if necessary
-			for k, v := range s.clients {
-				if v.Closed() {
-					delete(s.clientMemo, v.AddrStr())
-					delete(s.clients, k)
-				}
+			for _, v := range s.schedulers {
+				v.Tick()
 			}
-			return nil
-		case amsg := <-s.recvMsgCh:
-			// connect
-			if amsg.Message.Type == MsgConnect {
-				addr := amsg.Addr.String()
-				_, ok := s.clientMemo[addr]
+
+		case amsg := <-s.recvCh:
+			if amsg.message.Type == MsgConnect {
+				addr := amsg.addr.String()
+				connId := 0
+				v, ok := s.schedulersWithAddr[addr]
+				if !ok {
+					// memo
+					connId = s.assignConnId()
+					sch := NewScheduler(s.ctx, connId, amsg.message.SeqNum, s.params, amsg.addr)
+					s.schedulers[connId] = sch
+					s.schedulersWithAddr[addr] = sch
+
+					// monitor
+					go s.readMonitor(sch.Done(), sch.RecvOutput())
+					go s.sendMonitor(sch.Done(), amsg.addr, sch.SendOutput())
+
+				} else {
+					connId = v.ConnID()
+				}
+
+				//send ack back
+				s.ackBack(amsg.addr, connId, amsg.message.SeqNum)
+
+			} else if amsg.message.Type == MsgData {
+				addr := amsg.addr.String()
+				v, ok := s.schedulersWithAddr[addr]
 				if ok {
-					// client already exist
-					continue
+					v.Recv(amsg.message)
 				}
-
-				cli := NewCommonClient(s.ctx, amsg.Message.ConnID, s.params, amsg.Message.SeqNum+1, amsg.Addr)
-				s.clients[amsg.Message.ConnID] = cli
-				s.clientMemo[addr] = 1
-				continue
+			} else if amsg.message.Type == MsgAck || amsg.message.Type == MsgCAck {
+				addr := amsg.addr.String()
+				v, ok := s.schedulersWithAddr[addr]
+				if ok {
+					v.Ack(amsg.message)
+				}
 			}
 
-			// ack/data
-			// just transfer msg to the client
-			cli, ok := s.clients[amsg.Message.ConnID]
-			if !ok {
-				log.WithField("connId", amsg.Message.ConnID).Error("client not found")
-				continue
+		case c := <-s.closeConnCh:
+			sch, ok := s.schedulers[c]
+			if ok {
+				sch.Cancel()
+				addr := sch.AddrStr()
+				delete(s.schedulers, c)
+				delete(s.schedulersWithAddr, addr)
 			}
-			cli.Recv(amsg.Message)
+
+		case smsg := <-s.sendCh:
+			sch, ok := s.schedulers[smsg.ConnID]
+			if ok {
+				sch.Send(smsg.Payload)
+			}
 		}
+	}
+}
+
+func (s *server) ackBack(addr *lspnet.UDPAddr, connId int, sn int) error {
+	msg := NewAck(connId, sn)
+	amsg := NewMessageWithAddr(msg, addr)
+
+	select {
+	case <-s.ctx.Done():
+		return errClientClosed
+	case s.dataForWriteUPDCh <- amsg:
 	}
 	return nil
 }
 
-func (c *server) pushIntoCh(ch chan *Message, msg *Message) error {
-	select {
-	case <-c.ctx.Done():
-		return errClientClosed
-	case ch <- msg:
-		return nil
-	}
-}
-
-func (s *server) assignConnId() int {
-	s.curConnId += 1
-	return s.curConnId
-}
-
-func (s *server) recvMsgLoop() {
+func (s *server) recvLoop() {
 	defer s.g.Done()
-	defer log.Info("exit recvMsgLoop ...")
+	defer log.Info("exit readLoop")
 
 	readBytes := make([]byte, MAXN)
+
 	for {
 		select {
 		case <-s.ctx.Done():
@@ -206,21 +258,77 @@ func (s *server) recvMsgLoop() {
 
 		msg, addr, err := s.recvMessage(readBytes)
 		if err != nil {
+			log.WithError(err).Error("recvMessage failed")
 			continue
-		}
-
-		amsg := &MessageWithAddr{
-			Message: msg,
-			Addr:    addr,
 		}
 
 		select {
 		case <-s.ctx.Done():
 			return
-		case s.recvMsgCh <- amsg:
+		case s.recvCh <- NewMessageWithAddr(msg, addr):
 		}
 
 	}
+}
+
+// write data to udp
+func (s *server) writeLoop() {
+	defer s.g.Done()
+	defer log.Info("exit writeLoop")
+
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case amsg := <-s.dataForWriteUPDCh:
+			b, err := json.Marshal(amsg.message)
+			if err != nil {
+				log.WithError(err).Error("marshal failed")
+				continue
+			}
+			_, err = s.udpServer.WriteToUDP(b, amsg.addr)
+			if err != nil {
+				log.WithError(err).Error("server WriteToUDP failed")
+				continue
+			}
+		}
+	}
+}
+
+func (s *server) readMonitor(done <-chan struct{}, dataCh <-chan *Message) {
+	for {
+		select {
+		case <-done:
+			return
+		case msg := <-dataCh:
+			select {
+			case <-s.ctx.Done():
+				return
+			case s.dataForReadCh <- msg:
+
+			}
+		}
+	}
+}
+
+func (s *server) sendMonitor(done <-chan struct{}, addr *lspnet.UDPAddr, dataCh <-chan *Message) {
+	for {
+		select {
+		case <-done:
+			return
+		case msg := <-dataCh:
+			select {
+			case <-s.ctx.Done():
+				return
+			case s.dataForWriteUPDCh <- NewMessageWithAddr(msg, addr):
+			}
+		}
+	}
+}
+
+func (s *server) assignConnId() int {
+	s.curConnId += 1
+	return s.curConnId
 }
 
 func (c *server) recvMessage(readBytes []byte) (*Message, *lspnet.UDPAddr, error) {

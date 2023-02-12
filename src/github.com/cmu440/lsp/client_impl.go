@@ -15,19 +15,29 @@ import (
 
 var (
 	errClientClosed = fmt.Errorf("client is alread closed")
+	errClientLost   = fmt.Errorf("conn is lost")
 )
 
 type client struct {
 	// control
 	ctx    context.Context
 	cancel context.CancelFunc
-	g      *sync.WaitGroup
 
-	params *Params
 	conn   *lspnet.UDPConn
 	connID int
 
-	commonClient *CommonClient
+	sendSch *SendScheduler
+	recvSch *RecvScheduler
+	params  *Params
+
+	epoch         int
+	lastRecvEpoch int // lastest epoch stamp when recieve msg from server
+
+	readCh     chan *Message
+	writeCh    chan *Message
+	sendCh     chan []byte
+	epochTimer *time.Timer
+	g          *sync.WaitGroup
 }
 
 // NewClient creates, initiates, and returns a new client. This function
@@ -55,7 +65,7 @@ func NewClient(hostport string, initialSeqNum int, params *Params) (Client, erro
 		return nil, err
 	}
 
-	connect := func() (int, error) {
+	connect := func(sn int) (int, error) {
 		// try connect
 		readBytes := make([]byte, MAXN)
 		connID := 0
@@ -79,38 +89,157 @@ func NewClient(hostport string, initialSeqNum int, params *Params) (Client, erro
 				return 0, err
 			}
 
-			if msg.Type == MsgAck && msg.ConnID != 0 {
+			log.WithField("msg", msg).Trace("recieved ack from server")
+			if msg.Type == MsgAck && msg.ConnID != 0 && msg.SeqNum == sn {
 				connID = msg.ConnID
 				done = true
 				break
 			}
 		}
 		if !done {
-			err := fmt.Errorf("connect failed")
+			err := fmt.Errorf("connect failed, no recieve msg from server or msg is invalid")
 			log.WithError(err).Error("")
 			return 0, err
 		}
 		return connID, nil
 	}
 
-	connID, err := connect()
+	connID, err := connect(initialSeqNum)
 	if err != nil {
 		conn.Close()
 		return nil, err
 	}
 
+	log.WithField("connID", connID).Trace("client conn online, working ...")
+
 	// build common client
 	ctx, cancel := context.WithCancel(context.Background())
-	commonClient := NewCommonClient(ctx, connID, params, initialSeqNum+1, nil)
 	c := &client{
-		ctx:          ctx,
-		cancel:       cancel,
-		connID:       connID,
-		conn:         conn,
-		commonClient: commonClient,
+		ctx:        ctx,
+		cancel:     cancel,
+		connID:     connID,
+		conn:       conn,
+		sendSch:    NewSendScheduler(ctx, connID, initialSeqNum, params),
+		recvSch:    NewRecvScheduler(ctx, connID, initialSeqNum, params),
+		params:     params,
+		readCh:     make(chan *Message, 1000),
+		writeCh:    make(chan *Message, 100),
+		sendCh:     make(chan []byte, 100),
+		epochTimer: time.NewTimer(time.Millisecond * time.Duration(params.EpochMillis)),
+		g:          &sync.WaitGroup{},
 	}
 
+	c.g.Add(3)
+	go c.mainLoop()
+	go c.recvLoop()
+	go c.writeLoop()
+
 	return c, nil
+}
+
+func (c *client) mainLoop() {
+	defer c.g.Done()
+	defer log.Info("exit mainLoop")
+
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+
+		case payload := <-c.sendCh:
+			c.sendSch.Send(payload)
+
+		case <-c.epochTimer.C:
+			c.sendSch.Tick()
+
+		case msg := <-c.readCh:
+			if msg == nil {
+				continue
+			}
+			c.lastRecvEpoch = c.epoch
+
+			if msg.Type == MsgAck || msg.Type == MsgCAck {
+				c.sendSch.Ack(msg)
+				continue
+			}
+
+			if msg.Type == MsgData {
+				c.recvSch.Recv(msg)
+
+				// send ack back
+				c.addMsgToWriteCh(NewAck(c.connID, msg.SeqNum))
+
+				continue
+			}
+
+			// no connect for client side
+			// if msg.Type == MsgConnect {
+
+			// }
+		}
+	}
+}
+
+func (c *client) recvLoop() {
+	defer c.g.Done()
+	defer log.Info("exit recvLoop")
+
+	readBytes := make([]byte, MAXN)
+
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		default:
+		}
+
+		msg, err := recvMessage(c.conn, readBytes, c.params)
+		if err != nil {
+			log.WithError(err).Error("recvMessage failed")
+			continue
+		}
+
+		select {
+		case <-c.ctx.Done():
+			return
+		case c.readCh <- msg:
+		}
+
+	}
+}
+
+func (c *client) writeLoop() {
+	defer c.g.Done()
+	defer log.Info("exit writeLoop")
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case msg := <-c.sendSch.Output():
+			writeMsg(c.conn, msg)
+		}
+
+	}
+}
+
+func (c *client) addMsgToWriteCh(msg *Message) error {
+	select {
+	case <-c.ctx.Done():
+		return errClientClosed
+	case c.writeCh <- msg:
+		return nil
+	}
+}
+
+func writeMsg(conn *lspnet.UDPConn, msg *Message) error {
+	b, err := json.Marshal(msg)
+	if err != nil {
+		log.WithError(err).Error("marshal msg failed")
+		return err
+	}
+
+	_, err = conn.Write(b)
+	return err
 }
 
 func recvMessage(conn *lspnet.UDPConn, readBytes []byte, params *Params) (*Message, error) {
@@ -134,18 +263,19 @@ func (c *client) Read() ([]byte, error) {
 	select {
 	case <-c.ctx.Done():
 		return nil, errClientClosed
-	default:
+	case msg := <-c.recvSch.Output():
+		return msg.Payload, nil
 	}
-	return c.commonClient.Read()
+
 }
 
 func (c *client) Write(payload []byte) error {
 	select {
 	case <-c.ctx.Done():
 		return errClientClosed
-	default:
+	case c.sendCh <- payload:
+		return nil
 	}
-	return c.commonClient.Send(payload)
 }
 
 func (c *client) Close() error {
@@ -154,7 +284,7 @@ func (c *client) Close() error {
 		return errClientClosed
 	default:
 	}
-	c.commonClient.Close()
+
 	c.cancel()
 	c.conn.Close()
 	return nil

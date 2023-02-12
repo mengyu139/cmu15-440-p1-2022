@@ -14,6 +14,9 @@ type MessageData struct {
 
 func CreateMessageData(msg *Message) *MessageData {
 	return &MessageData{
-		Message: msg,
+		Message:    msg,
+		lastTime:   time.Now(),
+		firstTime:  time.Now(),
+		curBackoff: 0,
 	}
 }
