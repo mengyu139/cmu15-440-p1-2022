@@ -320,7 +320,7 @@ func (s *server) recvLoop() {
 	readBytes := make([]byte, MAXN)
 
 	for {
-		log.Info("recvLoop wait msg ...")
+		log.Debug("recvLoop wait msg ...")
 
 		select {
 		case <-s.ctx.Done():
