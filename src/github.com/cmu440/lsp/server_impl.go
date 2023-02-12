@@ -286,6 +286,9 @@ func (s *server) mainLoop() {
 
 				if amsg.message.Type == MsgData {
 					v.Recv(amsg.message)
+					// ack back
+					s.ackBack(amsg.addr, amsg.message.ConnID, amsg.message.SeqNum)
+
 				} else if amsg.message.Type == MsgAck || amsg.message.Type == MsgCAck {
 					v.Ack(amsg.message)
 				}
@@ -309,6 +312,9 @@ func (s *server) ackBack(addr *lspnet.UDPAddr, connId int, sn int) error {
 	case <-s.ctx.Done():
 		return errClientClosed
 	case s.dataForWriteUPDCh <- amsg:
+		log.WithFields(log.Fields{
+			"msg": msg,
+		}).Info("ack back")
 	}
 	return nil
 }
@@ -334,12 +340,11 @@ func (s *server) recvLoop() {
 			continue
 		}
 
-		log.WithField("msg", msg).WithField("addr", addr).Info("recv client msg")
-
 		select {
 		case <-s.ctx.Done():
 			return
 		case s.recvCh <- NewMessageWithAddr(msg, addr):
+			log.WithField("msg", msg).Info("msg to recvCh")
 		}
 
 	}
@@ -365,6 +370,8 @@ func (s *server) writeLoop() {
 				log.WithError(err).Error("server WriteToUDP failed")
 				continue
 			}
+
+			log.WithField("msg", amsg.message).Info("write udp")
 		}
 	}
 }

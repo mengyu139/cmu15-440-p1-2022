@@ -99,9 +99,9 @@ func (s *SendScheduler) Tick(e int) {
 	}
 
 	// heartbeat
-	if time.Since(s.lastSendTimStamp).Milliseconds() > int64(s.params.EpochMillis)/2 {
-		s.output(NewAck(s.connId, 0))
-	}
+	// if time.Since(s.lastSendTimStamp).Milliseconds() > int64(s.params.EpochMillis)/2 {
+	// 	s.output(NewAck(s.connId, 0))
+	// }
 
 }
 
@@ -109,18 +109,23 @@ func (s *SendScheduler) Tick(e int) {
 // update window and unack cnt
 // transfer will be make
 func (s *SendScheduler) Ack(msg *Message) {
+	logger := log.WithField("sn", msg.SeqNum).WithField("func", "SendScheduler.Ack")
+
 	// filter
 	if msg.Type != MsgAck && msg.Type != MsgCAck {
+		logger.Info("not ack")
 		return
 	}
 	// heartbeat
 	if msg.ConnID == 0 || msg.SeqNum == 0 {
+		logger.WithField("connid", msg.ConnID).WithField("sn", msg.SeqNum).Info("connid 0 is invalid, sn is 0 means heartbeat msg")
 		return
 	}
 
 	// update window
 	sn := msg.SeqNum
 	if sn <= s.minAckSn {
+		logger.WithField("minAckSn", s.minAckSn).Info("already acked")
 		return
 	}
 

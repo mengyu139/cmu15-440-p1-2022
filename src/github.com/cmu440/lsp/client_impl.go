@@ -173,11 +173,25 @@ func (c *client) mainLoop() {
 				c.recvSch.Recv(msg)
 
 				// send ack back
-				c.addMsgToWriteCh(NewAck(c.connID, msg.SeqNum))
+				c.ackBack(c.connID, msg.SeqNum)
 
 				continue
 			}
 		}
+	}
+}
+
+func (c *client) ackBack(connId int, sn int) error {
+	msg := NewAck(connId, sn)
+
+	select {
+	case <-c.ctx.Done():
+		return errClientClosed
+	case c.writeCh <- msg:
+		log.WithFields(log.Fields{
+			"msg": msg,
+		}).Info("ack back")
+		return nil
 	}
 }
 
@@ -217,22 +231,17 @@ func (c *client) writeLoop() {
 			return
 		case msg := <-c.sendSch.Output():
 			c.lastSendEpoch = c.epoch
-			writeMsg(c.params, c.conn, msg)
+			writeUDP(c.params, c.conn, msg)
+
+		case msg := <-c.writeCh:
+			c.lastSendEpoch = c.epoch
+			writeUDP(c.params, c.conn, msg)
 		}
 
 	}
 }
 
-func (c *client) addMsgToWriteCh(msg *Message) error {
-	select {
-	case <-c.ctx.Done():
-		return errClientClosed
-	case c.writeCh <- msg:
-		return nil
-	}
-}
-
-func writeMsg(params *Params, conn *lspnet.UDPConn, msg *Message) error {
+func writeUDP(params *Params, conn *lspnet.UDPConn, msg *Message) error {
 	conn.SetDeadline(time.Now().Add(time.Millisecond * time.Duration(params.EpochMillis)))
 
 	b, err := json.Marshal(msg)
@@ -248,7 +257,7 @@ func writeMsg(params *Params, conn *lspnet.UDPConn, msg *Message) error {
 		logger.WithError(err).Error("Write UDP failed")
 
 	}
-	logger.Info("writed")
+	logger.Debug("writed")
 	return err
 }
 
